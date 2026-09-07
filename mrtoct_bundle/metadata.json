@@ -1,0 +1,39 @@
+{
+  "model_info": {
+    "trainer_name": "nnUNetTrainerRegression_impact",
+    "dataset_name": "Dataset038_DoseRAD2026_proton_MR_CT_regression",
+    "configuration": "3d_fullres",
+    "fold": "all"
+  },
+  "inference_config": {
+    "patch_size": [
+      48,
+      192,
+      192
+    ],
+    "tile_step_size": 0.5,
+    "use_gaussian": true
+  },
+  "normalization": {
+    "input": {
+      "scheme": "ZScoreNormalization",
+      "mean": 35.56922149658203,
+      "std": 77.80585479736328,
+      "percentile_00_5": 0.0,
+      "percentile_99_5": 390.0,
+      "median": 0.0,
+      "min": 0.0,
+      "max": 2575.0
+    },
+    "output": {
+      "scheme": "GlobalNormalization",
+      "mean": -786.09033203125,
+      "std": 429.90985107421875,
+      "percentile_00_5": -1024.0,
+      "percentile_99_5": 374.6146783447257,
+      "median": -1024.0,
+      "min": -1024.0,
+      "max": 3071.0
+    }
+  }
+}

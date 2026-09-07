@@ -1,0 +1,22 @@
+# Keep the build context small. The Dockerfile only COPYs configs.py,
+# engines.py, loaders.py and submission/, so exclude everything heavy/irrelevant.
+.git
+__pycache__
+**/__pycache__
+*.pyc
+.venv/
+.pytest_cache/
+*.egg-info/
+out/
+data/
+analysis_outputs/
+comet_offline/
+submission/test/_scratch
+submission/test/_bench
+*.mha
+# Saved container images must never enter the build context — do_save.sh writes
+# its output into the repo, and a previous 3.5 GB tarball left in submission/
+# got COPYed into the next image.
+*.tar.gz
+*.tar.gz~
+*.tar

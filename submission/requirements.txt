@@ -1,0 +1,23 @@
+# Container deps for the DoseRAD submission. torch + CUDA come from the base
+# image; numpy is left to the base image so it stays compatible with the base
+# torch build.
+#
+# pydosert is VENDORED (pydosert/, COPYd by the Dockerfile) rather than
+# pip-installed, so ITS runtime dependencies are now ours to declare. The block
+# below is pydosert's dependency list minus torch/numpy.
+SimpleITK==2.4.1
+scipy==1.15.2
+natsort==7.1.1
+matplotlib==3.10.8
+fastapi
+uvicorn
+
+# --- pydosert's own runtime dependencies ---
+scikit-image==0.25.2
+pydantic==2.11.0
+pydantic-settings==2.11.0
+imageio==2.37.0
+pydicom==2.4.4
+rt-utils==1.2.7
+numba==0.62.1
+llvmlite==0.45.1

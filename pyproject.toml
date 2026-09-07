@@ -1,0 +1,55 @@
+[project]
+name = "doserad2026"
+version = "2.0.0"
+description = "DoseRAD2026 photon dose correction (CT + MR arms)."
+requires-python = ">=3.11,<3.14"
+
+# pydosert is the PHOTON package: it comes from the `doserad` BRANCH of
+# UMU-DDI/PyDoseRT and imports as `pydosert`. This is a different package from
+# the `pydose_rt` that the proton training uses off the same repo's main line --
+# the two names coexist in one environment, but they are different code.
+#
+# PINNED BY COMMIT, deliberately. The shipped submission container was built
+# against an older `doserad` branch head. Keep the dependency commit-pinned so
+# training and serving use identical physics; advance the pin deliberately
+# whenever that branch's engine changes.
+dependencies = [
+    "torch>=2.6.0",
+    "numpy>=2.3.0",
+    "scipy>=1.15.2",
+    "pandas>=2.3.3",
+    "SimpleITK>=2.4.1",
+    "natsort>=7.1.1",
+    "matplotlib>=3.10.8",
+    "tqdm>=4.67.1",
+    "comet_ml>=3.53.2",
+    "pymedphys>=0.41.0",
+    "pydosert @ git+https://github.com/UMU-DDI/PyDoseRT.git@d74b4038acdc5e68ec6b49bd7d58c2dfc567f332",
+    # pymedphys' gamma DTA search reaches econforge `interpolation`, whose
+    # vendored tempita does `import cgi` -- removed from the stdlib in 3.13
+    # (PEP 594). Without this the failure surfaces as a misleading
+    # FileNotFoundError about pymedphys' own dependency-extra.txt.
+    "legacy-cgi; python_version >= '3.13'",
+]
+
+[project.optional-dependencies]
+# Only baseline/{photon,proton,utils}.py need this, and they import it lazily
+# (see loaders.py:710). Training and inference never touch it.
+baseline = ["pyRadPlan>=0.3.3"]
+
+[tool.setuptools]
+py-modules = ["configs", "engines", "loaders", "sct", "plotting", "fixed_priors", "lateral_scatter"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["pydosert_experiments*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+markers = [
+    "separable_benchmark: opt-in performance benchmark (set PYDOSERT_RUN_SEPARABLE_BENCHMARK=1)",
+]
+
+[build-system]
+requires = ["setuptools>=68.2.2"]
+build-backend = "setuptools.build_meta"

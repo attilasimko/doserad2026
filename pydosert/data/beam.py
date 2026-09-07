@@ -1,0 +1,967 @@
+"""
+Beam and BeamSequence data structures for radiotherapy treatment planning.
+
+These classes provide a clean abstraction for beam parameters while maintaining
+full differentiability for deep learning workflows.
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Iterator, TYPE_CHECKING, Optional
+
+import numpy as np
+import torch
+
+if TYPE_CHECKING:
+    from pydosert.data import MachineConfig
+    from pydosert.engine.dose_engine import DoseEngine
+
+
+# ---------------------------------------------------------------------------
+# Beam-parameter conditioning
+# ---------------------------------------------------------------------------
+# Differentiable map from unconstrained optimization variables to physical beam parameters,
+# shared by direct optimization and deep-learning workflows so both condition identically.
+
+
+def make_ordered_pairs(x: torch.Tensor, min_opening: float = 0.0,
+                       max_opening: float = 100.0) -> torch.Tensor:
+    """
+    x: [..., 2]
+    Interprets:
+      x[..., 0] = center
+      x[..., 1] = raw width parameter
+
+    Returns:
+      ordered pairs [..., 2] where:
+        left  = center - width/2
+        right = center + width/2
+      and width >= min_opening
+
+    Uses sigmoid — it saturates less aggressively in absolute terms than
+    tanh (at raw x=3: sigmoid output is 95% of max, tanh is 99.5%), so the
+    gradient stays usable across the full output range.
+    """
+    center = (max_opening * torch.sigmoid(x[..., 0])) - max_opening / 2.0
+    width = min_opening + ((max_opening - min_opening) * torch.sigmoid(x[..., 1]))
+
+    left = center - 0.5 * width
+    right = center + 0.5 * width
+
+    return torch.stack([left, right], dim=-1)
+
+
+def condition_beam_params(leafs_raw, mus_raw, jaws_raw, normalize_mu=True, mu_ref_total=1000.0):
+    """Shared parameterization for beam parameters.
+
+    Maps unconstrained variables (leafs_raw, mus_raw, jaws_raw) to physical, ordered leaf/jaw
+    pairs and positive MUs — used identically by direct optimization and deep learning.
+
+    ``normalize_mu`` (default True): scale the MU by ``mu_ref_total / num_cps`` so the
+    physical MU magnitude (which grows as ~1/num_cps for a fixed total) is built into the
+    conditioning rather than chased with a per-group MU learning rate. ``num_cps`` is read
+    from ``mus_raw.shape[-1]``, so it adapts to the geometry automatically and raw_mu stays
+    ~O(1). Set False for the legacy unit-scale behaviour.
+    """
+    leafs = make_ordered_pairs(leafs_raw, min_opening=1.0)
+    mu_scale = (mu_ref_total / mus_raw.shape[-1]) if normalize_mu else 1.0
+    mus = mu_scale * torch.nn.functional.softplus(mus_raw) + 0.1
+    jaws = make_ordered_pairs(jaws_raw, min_opening=1.0, max_opening=150.0)
+    return leafs, mus, jaws
+
+
+@dataclass
+class Beam:
+    """
+    A single control point (beam) in a treatment arc for a single sample.
+
+    This is the atomic unit for beam representation - NO batch dimension.
+    For batched processing, stack multiple BeamSequences.
+
+    Attributes:
+        gantry_angle (float): Gantry angle in radians.
+        collimator_angle (float): Beam-limiting-device (collimator) angle in radians.
+        mu (torch.Tensor): Monitor units, scalar or [1].
+        leaf_positions (torch.Tensor): MLC leaf positions [N, 2] where 2=(left, right).
+        jaw_positions (torch.Tensor): Jaw positions [2] where 2=(lower, upper).
+        field_size (tuple[int, int]): Field size (width, height) in mm.
+        iso_center (tuple[float, float, float]): Isocenter position (x, y, z) in mm.
+        sid (float): Source-to-isocenter distance in mm.
+        ssd (float): Source-to-surface distance in mm.
+    """
+    gantry_angle: float  # radians
+    collimator_angle: float # radians
+    mu: torch.Tensor     # scalar or [1]
+    leaf_positions: torch.Tensor  # [N, 2]
+    jaw_positions: torch.Tensor   # [2]
+    field_size: tuple[int, int] = (400, 400)
+    iso_center: tuple[float, float, float] = (0, 0, 0)
+    sid: float = 1000.0
+    ssd: float = None
+
+    @classmethod
+    def create(
+        cls,
+        gantry_angle_deg: float,
+        number_of_leaf_pairs: int,
+        collimator_angle_deg:float = 0.0,
+        field_size_mm: tuple[int, int] = (400, 400),
+        iso_center: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        device: torch.device | str = 'cuda',
+        dtype: torch.dtype = torch.float32,
+        requires_grad: bool = True,
+    ) -> Beam:
+        """
+        Create a single beam at a specific gantry angle.
+
+        Args:
+            gantry_angle_deg (float): Gantry angle in degrees.
+            number_of_leaf_pairs (int): Number of MLC leaf pairs (N).
+            collimator_angle_deg (float): Collimator (BLD) angle in degrees. Default 0.0.
+            field_size_mm (tuple[int, int]): Field size (width, height) in mm. Default (400, 400).
+            iso_center (tuple[float, float, float]): Isocenter position (x, y, z) in mm. Default (0, 0, 0).
+            device (torch.device | str): PyTorch device.
+            dtype (torch.dtype): Data type for tensors.
+            requires_grad (bool): Whether tensors require gradients (for optimization).
+
+        Returns:
+            Beam: Initialized beam (fully open field), with leaf_positions [N, 2],
+                jaw_positions [2] and scalar mu.
+
+        Example:            
+            >>> beam = Beam.create(90.0, number_of_leaf_pairs=60, requires_grad=True)
+            >>> dose = dose_engine.compute_single_beam(beam, ct_image)
+            >>> loss.backward()  # Gradients flow to beam parameters
+        """
+        field_w, field_h = field_size_mm
+
+        # Initialize leaves at field edges (fully open) [N, 2]
+        leaf_positions = torch.zeros(number_of_leaf_pairs, 2, device=device, dtype=dtype)
+        leaf_positions[:, 0] = -field_w / 2  # Left leaves
+        leaf_positions[:, 1] = field_w / 2   # Right leaves
+
+        # Initialize jaws at field edges [2]
+        jaw_positions = torch.zeros(2, device=device, dtype=dtype)
+        jaw_positions[0] = -field_h / 2  # Lower jaw
+        jaw_positions[1] = field_h / 2   # Upper jaw
+
+        # MU initialized to 1.0 (scalar)
+        mu = torch.ones(1, device=device, dtype=dtype).squeeze()
+
+        if requires_grad:
+            leaf_positions = leaf_positions.requires_grad_(True)
+            jaw_positions = jaw_positions.requires_grad_(True)
+            mu = mu.requires_grad_(True)
+
+        return cls(
+            gantry_angle=math.radians(gantry_angle_deg),
+            collimator_angle=math.radians(collimator_angle_deg),
+            mu=mu,
+            ssd=1000.0,
+            leaf_positions=leaf_positions,
+            jaw_positions=jaw_positions,
+            iso_center=iso_center
+        )
+
+    @property
+    def gantry_angle_deg(self) -> float:
+        """Gantry angle in degrees."""
+        return math.degrees(self.gantry_angle)
+
+    @property
+    def device(self) -> torch.device:
+        """Device of the underlying tensors."""
+        return self.leaf_positions.device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """Data type of the underlying tensors."""
+        return self.leaf_positions.dtype
+
+    @property
+    def num_leaf_pairs(self) -> int:
+        """Number of MLC leaf pairs."""
+        return self.leaf_positions.shape[0]
+
+    @property
+    def requires_grad(self) -> bool:
+        """Whether any tensor requires gradients."""
+        return (
+            self.leaf_positions.requires_grad or
+            self.jaw_positions.requires_grad or
+            self.mu.requires_grad
+        )
+
+    def detach(self) -> Beam:
+        """
+        Return a new Beam with detached tensors (no gradient tracking).
+
+        Returns:
+            Beam: Copy with mu, leaf_positions [N, 2] and jaw_positions [2] detached.
+        """
+        return Beam(
+            gantry_angle=self.gantry_angle,
+            collimator_angle=self.collimator_angle,
+            mu=self.mu.detach(),
+            leaf_positions=self.leaf_positions.detach(),
+            jaw_positions=self.jaw_positions.detach(),
+            field_size=self.field_size,
+            iso_center=self.iso_center,
+            sid=self.sid,
+            ssd=self.ssd
+        )
+
+    def clone(self) -> Beam:
+        """
+        Return a deep copy of this Beam.
+
+        Returns:
+            Beam: Copy with cloned mu, leaf_positions [N, 2] and jaw_positions [2].
+        """
+        return Beam(
+            gantry_angle=self.gantry_angle,
+            collimator_angle=self.collimator_angle,
+            mu=self.mu.clone(),
+            leaf_positions=self.leaf_positions.clone(),
+            jaw_positions=self.jaw_positions.clone(),
+            field_size=self.field_size,
+            iso_center=self.iso_center,
+            sid=self.sid,
+            ssd=self.ssd
+        )
+
+    def to(self, device: torch.device | str) -> Beam:
+        """
+        Move beam tensors to a different device.
+
+        Args:
+            device (torch.device | str): Target device.
+
+        Returns:
+            Beam: New beam with tensors on the target device.
+        """
+        return Beam(
+            gantry_angle=self.gantry_angle,
+            collimator_angle=self.collimator_angle,
+            mu=self.mu.to(device),
+            leaf_positions=self.leaf_positions.to(device),
+            jaw_positions=self.jaw_positions.to(device),
+            field_size=self.field_size,
+            iso_center=self.iso_center,
+            sid=self.sid,
+            ssd=self.ssd
+        )
+
+
+@dataclass
+class BeamSequence:
+    """
+    A sequence of control points (beams) for a single treatment arc.
+
+    NO batch dimension - represents a single sample's treatment.
+    For batched processing, use BeamSequence.stack() to combine multiple sequences.
+
+    When you index into a BeamSequence (e.g., `beam_seq[0]`), you get a `Beam`
+    whose tensors are VIEWS into the original data - gradients flow back.
+
+    Attributes:
+        mus (torch.Tensor): Monitor units [CP].
+        leaf_positions (torch.Tensor): MLC positions [CP, N, 2] where 2=(left, right).
+        jaw_positions (torch.Tensor): Jaw positions [CP, 2] where 2=(lower, upper).
+        field_size (tuple[int, int]): Field size (width, height) in mm.
+        iso_center (tuple[float, float, float]): Isocenter position (x, y, z) in mm.
+        sid (float): Source-to-isocenter distance in mm.
+        gantry_angles (Optional[torch.Tensor]): Gantry angles in radians [CP], or None to use engine's angles.
+        collimator_angles (Optional[torch.Tensor]): Collimator (BLD) angles in radians [CP], or None.
+
+    Example - From DICOM:
+        >>> beam_seq = BeamSequence.from_treatment_config(treatment_config)
+        >>> for beam in beam_seq:
+        ...     print(f"Beam at {beam.gantry_angle_deg}deg")
+
+    Example - Batching multiple sequences:
+        >>> sequences = [seq1, seq2, seq3]
+        >>> batched_leafs, batched_mus, batched_jaws = BeamSequence.stack(sequences)
+        >>> dose = engine.forward(batched_leafs, batched_mus, batched_jaws, ct_batch)
+    """
+    mus: torch.Tensor             # [CP]
+    leaf_positions: torch.Tensor  # [CP, N, 2]
+    jaw_positions: torch.Tensor   # [CP, 2]
+    field_size: tuple[int, int]
+    iso_center: tuple[float, float, float]
+    sid: float
+    gantry_angles: Optional[torch.Tensor] = None  # [CP] in radians, or None to use engine's
+    collimator_angles: Optional[torch.Tensor] = None
+
+    @property
+    def has_gantry_angles(self) -> bool:
+        """Whether this BeamSequence has explicit gantry angles."""
+        return self.gantry_angles is not None
+
+    def __post_init__(self):
+        """Validate tensor shapes."""
+        CP = self.leaf_positions.shape[0]  # [CP, N, 2] -> CP is dim 0
+
+        if self.gantry_angles is not None:
+            assert len(self.gantry_angles) == CP, \
+                f"gantry_angles length {len(self.gantry_angles)} doesn't match CP count {CP}"
+
+        assert self.mus.shape == (CP,), \
+            f"mus shape {self.mus.shape} doesn't match expected ({CP},)"
+        assert self.leaf_positions.shape[0] == CP and self.leaf_positions.shape[2] == 2, \
+            f"leaf_positions shape should be [CP, N, 2], got: {self.leaf_positions.shape}"
+        assert self.jaw_positions.shape == (CP, 2), \
+            f"jaw_positions shape {self.jaw_positions.shape} doesn't match expected ({CP}, 2)"
+
+    @staticmethod
+    def stack(sequences: list[BeamSequence]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Stack multiple BeamSequences into batched tensors for the dose engine.
+
+        Args:
+            sequences (list[BeamSequence]): BeamSequence objects (must share CP count and leaf count).
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Batched tensors:
+            - leaf_positions [B, CP, N, 2] where 2=(left, right).
+            - mus [B, CP].
+            - jaw_positions [B, CP, 2] where 2=(lower, upper).
+
+        Example:
+            >>> batched_leafs, batched_mus, batched_jaws = BeamSequence.stack([seq1, seq2])
+            >>> dose = engine.forward(batched_leafs, batched_mus, batched_jaws, ct_batch)
+        """
+        if not sequences:
+            raise ValueError("Cannot stack empty list of BeamSequences")
+
+        leaf_positions = torch.stack([s.leaf_positions for s in sequences], dim=0)  # [B, CP, N, 2]
+        mus = torch.stack([s.mus for s in sequences], dim=0)  # [B, CP]
+        jaw_positions = torch.stack([s.jaw_positions for s in sequences], dim=0)  # [B, CP, 2]
+
+        return leaf_positions, mus, jaw_positions
+    
+    @classmethod
+    def create(
+        cls,
+        gantry_angles_deg: list[float] | torch.Tensor,
+        number_of_leaf_pairs: int,
+        field_size: tuple[int, int],
+        iso_center: tuple[float, float, float],
+        collimator_angles_deg: list[float] | torch.Tensor | None = None,
+        sid: float = 1000.0,
+        open_field_size: float = 0.0,
+        device: torch.device | str = 'cuda',
+        dtype: torch.dtype = torch.float32,
+        requires_grad: bool = True,
+    ) -> BeamSequence:
+        """
+        Create a BeamSequence with initialized parameters.
+        
+        Args:
+            gantry_angles_deg (list[float] | torch.Tensor): Gantry angles in degrees, length CP.
+            number_of_leaf_pairs (int): Number of MLC leaf pairs (N).
+            field_size (tuple[int, int]): Field size (width, height) in mm.
+            iso_center (tuple[float, float, float]): Isocenter position (x, y, z) in mm.
+            collimator_angles_deg (list[float] | torch.Tensor | None): BLD angles in degrees, or None for all zeros.
+            sid (float): Source-to-isocenter distance in mm.
+            open_field_size (float): Size of the open field in mm (0.0=closed).
+            device (torch.device | str): PyTorch device.
+            dtype (torch.dtype): Data type for tensors.
+            requires_grad (bool): Whether tensors require gradients.
+
+        Returns:
+            BeamSequence: Initialized sequence with leaf_positions [CP, N, 2],
+                jaw_positions [CP, 2], mus [CP] and gantry/collimator angles [CP].
+            
+        Example:
+            >>> angles = [0, 90, 180, 270]
+            >>> beam_seq = BeamSequence.create(
+            ...     gantry_angles_deg=angles,
+            ...     number_of_leaf_pairs=60,
+            ...     field_size=(400, 400),
+            ...     iso_center=(0, 0, 0),            
+            ...     open_field_size=200.0,  # 200mm open field
+            ... )
+        """
+        # Convert gantry angles to tensor in radians
+        if isinstance(gantry_angles_deg, list):
+            gantry_angles = torch.tensor(gantry_angles_deg, dtype=dtype, device=device)
+        else:
+            gantry_angles = gantry_angles_deg.to(dtype=dtype, device=device)
+            # Assume already in radians if tensor
+        gantry_angles = torch.deg2rad(gantry_angles)
+
+        num_cps = len(gantry_angles)
+        field_w, field_h = field_size
+        
+        # Initialize leaf positions [CP, N, 2]
+        leaf_positions = torch.zeros(num_cps, number_of_leaf_pairs, 2, device=device, dtype=dtype)
+        leaf_positions[:, :, 0] = -open_field_size / 2  # Left leaves
+        leaf_positions[:, :, 1] = open_field_size / 2   # Right leaves
+        
+        # Initialize jaw positions [CP, 2]
+        jaw_positions = torch.zeros(num_cps, 2, device=device, dtype=dtype)
+        jaw_positions[:, 0] = -open_field_size / 2  # Lower jaw
+        jaw_positions[:, 1] = open_field_size / 2   # Upper jaw
+        
+        # Initialize MUs [CP]
+        mus = torch.ones(num_cps, device=device, dtype=dtype)
+        
+        # Handle beam limiting device angles
+        if collimator_angles_deg is None:
+            collimator_angles = torch.zeros(num_cps, device=device, dtype=dtype)
+        elif isinstance(collimator_angles_deg, list):
+            collimator_angles = torch.tensor(collimator_angles_deg, dtype=dtype, device=device)
+        else:
+            collimator_angles = collimator_angles_deg.to(dtype=dtype, device=device)
+        collimator_angles = torch.deg2rad(collimator_angles)
+        
+        # Set requires_grad
+        if requires_grad:
+            leaf_positions.requires_grad_(True)
+            jaw_positions.requires_grad_(True)
+            mus.requires_grad_(True)
+        
+        return cls(
+            mus=mus,
+            leaf_positions=leaf_positions,
+            jaw_positions=jaw_positions,
+            gantry_angles=gantry_angles,
+            collimator_angles=collimator_angles,
+            field_size=field_size,
+            iso_center=iso_center,
+            sid=sid,
+        )
+
+    @classmethod
+    def prepare_for_engine(
+        cls,
+        leaf_positions: torch.Tensor,
+        mus: torch.Tensor,
+        jaw_positions: torch.Tensor,
+        dose_engine: 'DoseEngine',
+    ) -> BeamSequence:
+        """
+        Create a BeamSequence from tensors, filling metadata from the dose engine.
+        This is useful for deep learning applications where you have predicted or
+        optimized tensors but don't have the original beam specifications. The dose
+        engine provides all necessary geometric and machine parameters.
+
+        Args:
+            leaf_positions (torch.Tensor): MLC positions [CP, N, 2] where N is number of leaf pairs.
+            mus (torch.Tensor): Monitor units [CP] where CP is number of control points.
+            jaw_positions (torch.Tensor): Jaw positions [CP, 2] where 2=(lower, upper).
+            dose_engine (DoseEngine): Instance to extract metadata from.
+
+        Returns:
+            BeamSequence: Ready to use with the dose engine (gradients flow through).
+
+        Raises:
+            ValueError: If tensor shapes don't match dose engine expectations.
+        Example:
+            >>> # After training a model that predicts beam parameters
+            >>> predicted_leafs = model(input)  # [CP, N, 2]
+            >>> predicted_mus = mu_model(input)  # [CP]
+            >>> predicted_jaws = jaw_model(input)  # [CP, 2]
+            >>>
+            >>> beam_seq = BeamSequence.prepare_for_engine(
+            ...     leaf_positions=predicted_leafs,
+            ...     mus=predicted_mus,
+            ...     jaw_positions=predicted_jaws,
+            ...     dose_engine=engine
+            ... )
+            >>> dose = engine.compute_beam_sequence(beam_seq, ct_image)
+        """
+        # Validate shapes
+        expected_cp = dose_engine.number_of_beams
+        expected_leafs = dose_engine.machine_config.number_of_leaf_pairs
+
+        # Check leaf_positions shape [CP, N, 2]
+        if leaf_positions.dim() != 3:
+            raise ValueError(
+                f"leaf_positions must be 3D [CP, N, 2], got {leaf_positions.dim()}D: {leaf_positions.shape}"
+            )
+        if leaf_positions.shape[0] != expected_cp:
+            raise ValueError(
+                f"leaf_positions CP count mismatch: expected {expected_cp}, got {leaf_positions.shape[0]}"
+            )
+        if leaf_positions.shape[1] != expected_leafs:
+            raise ValueError(
+                f"leaf_positions leaf pair count mismatch: expected {expected_leafs}, got {leaf_positions.shape[1]}"
+            )
+        if leaf_positions.shape[2] != 2:
+            raise ValueError(
+                f"leaf_positions last dimension must be 2 (left, right), got {leaf_positions.shape[2]}"
+            )
+
+        # Check mus shape [CP]
+        if mus.dim() != 1:
+            raise ValueError(
+                f"mus must be 1D [CP], got {mus.dim()}D: {mus.shape}"
+            )
+        if mus.shape[0] != expected_cp:
+            raise ValueError(
+                f"mus CP count mismatch: expected {expected_cp}, got {mus.shape[0]}"
+            )
+
+        # Check jaw_positions shape [CP, 2]
+        if jaw_positions.dim() != 2:
+            raise ValueError(
+                f"jaw_positions must be 2D [CP, 2], got {jaw_positions.dim()}D: {jaw_positions.shape}"
+            )
+        if jaw_positions.shape[0] != expected_cp:
+            raise ValueError(
+                f"jaw_positions CP count mismatch: expected {expected_cp}, got {jaw_positions.shape[0]}"
+            )
+        if jaw_positions.shape[1] != 2:
+            raise ValueError(
+                f"jaw_positions last dimension must be 2 (lower, upper), got {jaw_positions.shape[1]}"
+            )
+
+        return cls.from_tensors(
+            leaf_positions=leaf_positions,
+            mus=mus,
+            jaw_positions=jaw_positions,
+            gantry_angles=dose_engine.gantry_angles,
+            collimator_angles=dose_engine.collimator_angles,
+            iso_center=dose_engine.iso_center,
+            sid=dose_engine.SID,
+            field_size=dose_engine.field_size,
+        )
+    
+    @classmethod
+    def from_tensors(
+        cls,
+        leaf_positions: torch.Tensor,
+        mus: torch.Tensor,
+        jaw_positions: torch.Tensor,
+        gantry_angles: torch.Tensor,
+        collimator_angles: torch.Tensor,
+        iso_center: float,
+        sid: float,
+        field_size: tuple[float, float]
+
+    ) -> BeamSequence:
+        """
+        Create a BeamSequence from raw tensors.
+
+        Args:
+            leaf_positions (torch.Tensor): MLC positions [CP, N, 2] where 2=(left, right).
+            mus (torch.Tensor): Monitor units [CP].
+            jaw_positions (torch.Tensor): Jaw positions [CP, 2] where 2=(lower, upper).
+            gantry_angles (torch.Tensor): Gantry angles in radians [CP].
+            collimator_angles (torch.Tensor): Collimator (BLD) angles in radians [CP].
+            iso_center (float): Isocenter position (x, y, z) in mm.
+            sid (float): Source-to-isocenter distance in mm.
+            field_size (tuple[float, float]): Field size (width, height) in mm.
+
+        Returns:
+            BeamSequence: Wraps the provided tensors (no copy, gradients flow through).
+        """
+        return cls(
+            mus=mus,
+            leaf_positions=leaf_positions,
+            jaw_positions=jaw_positions,
+            gantry_angles=gantry_angles,
+            collimator_angles=collimator_angles,
+            iso_center=iso_center,
+            sid=sid,
+            field_size=field_size
+        )
+
+    @staticmethod
+    def _compute_gantry_angles(
+        num_cps: int,
+        starting_angle_deg: float,
+        clockwise: bool,
+        device: torch.device | str = 'cuda',
+        dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
+        """
+        Compute evenly spaced gantry angles over a 360-degree arc.
+
+        Args:
+            num_cps (int): Number of control points (CP).
+            starting_angle_deg (float): First gantry angle in degrees.
+            clockwise (bool): If True the arc increases, otherwise decreases.
+            device (torch.device | str): PyTorch device.
+            dtype (torch.dtype): Data type for the output tensor.
+
+        Returns:
+            torch.Tensor: Gantry angles in radians [CP], wrapped to [0, 2pi).
+        """
+        import math
+        import numpy as np
+
+        start = math.radians(starting_angle_deg)
+        if num_cps == 1:
+            return torch.tensor([start], dtype=dtype, device=device)
+
+        if clockwise:
+            end = start + math.radians(360)
+        else:
+            end = start - math.radians(360)
+
+        # Match the gantry_angles computation
+        angles = np.linspace(start, end, num_cps + 2, endpoint=False)[:-2] % (2 * math.pi)
+        return torch.tensor(angles, dtype=dtype, device=device)
+
+    @classmethod
+    def from_beams(cls, beams: list[Beam]) -> BeamSequence:
+        """
+        Stack individual Beam objects into a BeamSequence.
+
+        Note: This creates NEW tensors by stacking, so gradients will flow
+        to the stacked tensor, not the original Beam tensors.
+
+        Args:
+            beams (list[Beam]): Beam objects (must share leaf count, iso_center, sid, field_size).
+
+        Returns:
+            BeamSequence: Stacked parameters with leaf_positions [CP, N, 2],
+                jaw_positions [CP, 2], mus [CP] and angle tensors [CP].
+
+        Raises:
+            ValueError: If beams is empty.
+            Exception: If iso_center, sid or field_size differ across beams.
+        """
+        if not beams:
+            raise ValueError("Cannot create BeamSequence from empty list")
+
+        gantry_angles = torch.tensor(
+            [b.gantry_angle for b in beams],
+            dtype=beams[0].dtype,
+            device=beams[0].device,
+        )
+
+        collimator_angles = torch.tensor(
+            [b.collimator_angle for b in beams],
+            dtype=beams[0].dtype,
+            device=beams[0].device,
+        )
+
+        # Stack along CP dimension (dim 0)
+        # mu: scalar -> [CP]
+        mus = torch.stack([b.mu for b in beams], dim=0)  # [CP]
+
+        # leaf_positions: [N, 2] -> [CP, N, 2]
+        leaf_positions = torch.stack([b.leaf_positions for b in beams], dim=0)  # [CP, N, 2]
+
+        # jaw_positions: [2] -> [CP, 2]
+        jaw_positions = torch.stack([b.jaw_positions for b in beams], dim=0)  # [CP, 2]
+
+        if np.all([np.all(b.iso_center == beams[0].iso_center) for b in beams]):
+            iso_center = beams[0].iso_center
+        else:
+            raise Exception("Isocenters are different for different beams. This will not work.")
+        
+        if np.all([np.all(b.sid == beams[0].sid) for b in beams]):
+            sid = beams[0].sid
+        else:
+            raise Exception("SID are different for different beams. This will not work.")
+        
+        if np.all([np.all(b.field_size == beams[0].field_size) for b in beams]):
+            field_size = beams[0].field_size
+        else:
+            raise Exception("Field sizes are different for different beams. This will not work.")
+        
+
+        return cls(
+            mus=mus,
+            leaf_positions=leaf_positions,
+            jaw_positions=jaw_positions,
+            gantry_angles=gantry_angles,
+            collimator_angles=collimator_angles,
+            iso_center=iso_center,
+            sid=sid,
+            field_size=field_size
+        )
+
+    def __len__(self) -> int:
+        """Number of control points in the sequence."""
+        return self.leaf_positions.shape[0]  # [CP, N, 2] -> CP is dim 0
+
+    def __getitem__(self, idx: int | slice) -> Beam:
+        """
+        Get a single Beam at the specified index.
+
+        The returned Beam contains VIEWS into the original tensors,
+        not copies. Gradients flow back to the original BeamSequence tensors.
+
+        Args:
+            idx (int | slice): Control point index (0-based), or a slice. A slice
+                returns a BeamSequence view; an int returns a single Beam.
+
+        Returns:
+            Beam: With leaf_positions [N, 2], jaw_positions [2] and scalar mu that
+                are views into this sequence's tensors. A slice index instead returns
+                a BeamSequence view with leaf_positions [CP_slice, N, 2].
+
+        Raises:
+            IndexError: If an integer index is out of range.
+            ValueError: If gantry_angles is None (use engine's angles instead).
+        """
+        if isinstance(idx, slice):
+            return BeamSequence(
+                mus=self.mus[idx],
+                leaf_positions=self.leaf_positions[idx, :, :],
+                jaw_positions=self.jaw_positions[idx, :],
+                gantry_angles=self.gantry_angles[idx] if self.gantry_angles is not None else None,
+                collimator_angles=self.collimator_angles[idx] if self.collimator_angles is not None else None,
+                field_size=self.field_size,
+                iso_center=self.iso_center,
+                sid=self.sid,
+            )
+        else:
+            if idx < 0:
+                idx = len(self) + idx
+            if idx < 0 or idx >= len(self):
+                raise IndexError(f"Index {idx} out of range for BeamSequence of length {len(self)}")
+
+            if self.gantry_angles is None:
+                raise ValueError(
+                    "Cannot index into BeamSequence without gantry_angles. "
+                    "This BeamSequence relies on the engine's gantry angles."
+                )
+
+            return Beam(
+                gantry_angle=self.gantry_angles[idx].item(),
+                collimator_angle=self.collimator_angles[idx].item(),
+                mu=self.mus[idx],                    # scalar
+                leaf_positions=self.leaf_positions[idx, :, :],  # [N, 2]
+                jaw_positions=self.jaw_positions[idx, :],       # [2]
+                field_size=self.field_size,
+                iso_center=self.iso_center,
+                sid=self.sid
+            )
+
+    def __iter__(self) -> Iterator[Beam]:
+        """Iterate over all beams in the sequence."""
+        for i in range(len(self)):
+            yield self[i]
+
+    @property
+    def num_beams(self) -> int:
+        """Number of control points (alias for __len__)."""
+        return len(self)
+
+    @property
+    def num_leaf_pairs(self) -> int:
+        """Number of MLC leaf pairs."""
+        return self.leaf_positions.shape[1]  # [CP, N, 2] -> N is dim 1
+
+    @property
+    def device(self) -> torch.device:
+        """Device of the underlying tensors."""
+        return self.leaf_positions.device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """Data type of the underlying tensors."""
+        return self.leaf_positions.dtype
+
+    @property
+    def requires_grad(self) -> bool:
+        """Whether any tensor requires gradients."""
+        return (
+            self.leaf_positions.requires_grad or
+            self.jaw_positions.requires_grad or
+            self.mus.requires_grad
+        )
+
+    @property
+    def gantry_angles_deg(self) -> Optional[np.ndarray]:
+        """Gantry angles in degrees as numpy array, or None if not set."""
+        if self.gantry_angles is None:
+            return None
+        return np.degrees(self.gantry_angles.cpu().numpy())
+
+    def detach(self) -> BeamSequence:
+        """
+        Return a new BeamSequence with detached tensors.
+
+        Returns:
+            BeamSequence: Copy with mus [CP], leaf_positions [CP, N, 2],
+                jaw_positions [CP, 2] and angle tensors [CP] detached.
+        """
+        return BeamSequence(
+            mus=self.mus.detach(),
+            leaf_positions=self.leaf_positions.detach(),
+            jaw_positions=self.jaw_positions.detach(),
+            gantry_angles=self.gantry_angles.detach() if self.gantry_angles is not None else None,
+            collimator_angles=self.collimator_angles.detach() if self.collimator_angles is not None else None,
+            field_size=self.field_size,
+            iso_center=self.iso_center,
+            sid=self.sid
+        )
+
+    def clone(self) -> BeamSequence:
+        """
+        Return a deep copy of this BeamSequence.
+
+        Returns:
+            BeamSequence: Copy with cloned mus [CP], leaf_positions [CP, N, 2],
+                jaw_positions [CP, 2] and angle tensors [CP].
+        """
+        return BeamSequence(
+            mus=self.mus.clone(),
+            leaf_positions=self.leaf_positions.clone(),
+            jaw_positions=self.jaw_positions.clone(),
+            gantry_angles=self.gantry_angles.clone() if self.gantry_angles is not None else None,
+            collimator_angles=self.collimator_angles.clone() if self.collimator_angles is not None else None,
+            field_size=self.field_size,
+            iso_center=self.iso_center,
+            sid=self.sid
+        )
+
+    def to(self, device: torch.device | str) -> BeamSequence:
+        """
+        Move all tensors to a different device.
+
+        Args:
+            device (torch.device | str): Target device.
+
+        Returns:
+            BeamSequence: New sequence with all tensors on the target device.
+        """
+        return BeamSequence(
+            mus=self.mus.to(device),
+            leaf_positions=self.leaf_positions.to(device),
+            jaw_positions=self.jaw_positions.to(device),
+            gantry_angles=self.gantry_angles.to(device) if self.gantry_angles is not None else None,
+            collimator_angles=self.collimator_angles.to(device) if self.collimator_angles is not None else None,
+            field_size=self.field_size,
+            iso_center=self.iso_center,
+            sid=self.sid
+        )
+
+    def slice(self, start: int, end: int) -> BeamSequence:
+        """
+        Get a contiguous slice of control points as a new BeamSequence.
+
+        The returned BeamSequence contains VIEWS into the original tensors.
+
+        Args:
+            start (int): Start control-point index (inclusive).
+            end (int): End control-point index (exclusive).
+
+        Returns:
+            BeamSequence: View with leaf_positions [CP_slice, N, 2],
+                jaw_positions [CP_slice, 2], mus [CP_slice] and angle tensors [CP_slice].
+        """
+        return BeamSequence(
+            mus=self.mus[start:end],                              # [CP_slice]
+            leaf_positions=self.leaf_positions[start:end, :, :],  # [CP_slice, N, 2]
+            jaw_positions=self.jaw_positions[start:end, :],       # [CP_slice, 2]
+            gantry_angles=self.gantry_angles[start:end] if self.gantry_angles is not None else None,
+            collimator_angles=self.collimator_angles[start:end] if self.collimator_angles is not None else None,
+            field_size=self.field_size,
+            iso_center=self.iso_center,
+            sid=self.sid
+        )
+
+    def to_delivery(self) -> BeamSequence:
+        """
+        Convert control points to delivery positions by averaging adjacent points.
+
+        DICOM RT plans store N+1 control points, but dose is delivered at N
+        intermediate positions between them. This method computes those
+        intermediate positions.
+
+        The returned BeamSequence has N control points (one less than original),
+        where each value is the average of adjacent control points:
+            delivery[i] = (control_point[i] + control_point[i+1]) / 2
+
+        Gradients flow back to the original control points.
+
+        Returns:
+            BeamSequence: CP-1 averaged delivery positions with leaf_positions
+                [CP-1, N, 2], jaw_positions [CP-1, 2], mus [CP-1] and angle
+                tensors [CP-1] (angles averaged along the shortest arc).
+
+        Raises:
+            ValueError: If the sequence has fewer than 2 control points.
+        """
+        if len(self) < 2:
+            raise ValueError("Need at least 2 control points to compute delivery positions")
+
+        # Average adjacent control points - gradients flow through
+        # leaf_positions: [CP, N, 2] -> [CP-1, N, 2]
+        avg_leaf_positions = (
+            self.leaf_positions[:-1, :, :] + self.leaf_positions[1:, :, :]
+        ) / 2
+
+        # mus: [CP] -> [CP-1]
+        avg_mus = (self.mus[:-1] + self.mus[1:]) / 2
+
+        # jaw_positions: [CP, 2] -> [CP-1, 2]
+        avg_jaw_positions = (
+            self.jaw_positions[:-1, :] + self.jaw_positions[1:, :]
+        ) / 2
+
+        two_pi = 2 * math.pi
+        avg_gantry_angles = None
+        if self.gantry_angles is not None:
+            a = self.gantry_angles[:-1]
+            b = self.gantry_angles[1:]
+            # shortest signed difference in (-π, π]
+            delta = (b - a + math.pi) % two_pi - math.pi
+            # go halfway along that shortest arc and wrap back to [0, 2π)
+            avg_gantry_angles = (a + 0.5 * delta + two_pi) % two_pi
+
+        avg_collimator_angles = None
+        if self.collimator_angles is not None:
+            a = self.collimator_angles[:-1]
+            b = self.collimator_angles[1:]
+            delta = (b - a + math.pi) % two_pi - math.pi
+            avg_collimator_angles = (a + 0.5 * delta + two_pi) % two_pi
+
+        return BeamSequence(
+            mus=avg_mus,
+            leaf_positions=avg_leaf_positions,
+            jaw_positions=avg_jaw_positions,
+            gantry_angles=avg_gantry_angles,
+            collimator_angles=avg_collimator_angles,
+            field_size=self.field_size,
+            iso_center=self.iso_center,
+            sid=self.sid
+        )
+
+    @property
+    def control_points(self) -> BeamSequence:
+        """Alias for self - the original control point representation."""
+        return self
+
+    @property
+    def delivery(self) -> BeamSequence:
+        """
+        Property alias for to_delivery().
+
+        Convenient for chaining:
+            dose = engine.forward_beam_sequence(beam_seq.delivery)
+        """
+        return self.to_delivery()
+    def parameters(self) -> list[torch.Tensor]:
+        """
+        Return list of optimizable parameters.
+
+        Returns:
+            list[torch.Tensor]: [leaf_positions [CP, N, 2], jaw_positions [CP, 2], mus [CP]].
+        """
+        return [self.leaf_positions, self.jaw_positions, self.mus]
+
+    def requires_grad_(self, requires_grad: bool = True) -> BeamSequence:
+        """
+        Set requires_grad on leaf_positions, jaw_positions and mus in place.
+
+        Args:
+            requires_grad (bool): Whether the tensors should track gradients.
+
+        Returns:
+            BeamSequence: Self, for chaining.
+        """
+        self.leaf_positions.requires_grad_(requires_grad)
+        self.jaw_positions.requires_grad_(requires_grad)
+        self.mus.requires_grad_(requires_grad)
+        return self

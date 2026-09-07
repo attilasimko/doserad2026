@@ -1,0 +1,37 @@
+.env
+*.pyc
+__pycache__/
+.pytest_cache/
+.benchmarks/
+.vscode/
+.venv/
+*.egg-info/
+
+*.json
+!mrtoct_bundle/metadata.json
+# Vendored PyDoseRT ships machine and optimisation presets as JSON;
+# without this they are silently dropped and load_machine_config fails.
+!pydosert/**/*.json
+
+# Regenerable run output.
+analysis_outputs/
+comet_offline/
+out/
+out/submission/test/_scratch/
+
+# Volumes, arrays and checkpoints are never source. The exception is models/:
+# the shipped corrector and the two frozen priors it was built on, 6 MB total.
+*.mha
+*.npy
+*.npz
+*.pt
+!models/*.pt
+
+*.tar.gz
+*.tar.gz~
+example-submission/
+# The sCT bundle's TorchScript weights (390 MB) live on Hugging Face:
+#   https://huggingface.co/zimmeryWo/MRI-sCT_converter-DoseRAD2026
+# Fetch them with:  python -c "import sct; sct.fetch_bundle()"
+# The Dockerfile downloads them at build time, so the image is self-contained.
+mrtoct_bundle/model.pt
